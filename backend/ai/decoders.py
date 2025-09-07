@@ -375,4 +375,3 @@ class BigDecoder(nn.Module):
         modulated = (film_gamma * trunk_out) + film_beta
         output = self.trunk_base(modulated)
         return output
-

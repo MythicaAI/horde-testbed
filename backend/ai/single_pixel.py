@@ -351,6 +351,9 @@ def train_vfx_model(image_dir, device, epochs=1000, batch_size=8192, experiment_
                 print("Computing test batch...")
                 pred_batch = [model.full_image(test_control / T, H, W) for test_control in test_controls]
                 pred_batch = torch.stack(pred_batch).to(dtype=torch.float32)
+                # Match channels between GT and prediction (e.g., drop alpha)
+                target_C = base_batch.shape[-1]
+                pred_batch = pred_batch[..., :target_C]
                 print(f"Base batch shape: {base_batch.shape}, Pred batch shape: {pred_batch.shape}")
 
                 base_batch_nchw = base_batch.permute(0, 3, 1, 2)
@@ -377,4 +380,3 @@ def get_total_grad_norm(model, norm_type=2):
             total_norm += param_norm.item() ** norm_type
     total_norm = total_norm ** (1. / norm_type)
     return total_norm
-
