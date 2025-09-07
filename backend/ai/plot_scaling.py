@@ -172,7 +172,8 @@ def run_single_job(
 
             # 5) Params → BPP
             num_params = _count_trainable_params(model)
-            bpp = (num_params * bits_per_param) / max(1, (H * W))
+            # Bits-per-pixel over the whole sequence (amortized across frames)
+            bpp = (num_params * bits_per_param) / max(1, (H * W * T))
 
             per_dataset_metrics.append(
                 {
@@ -182,6 +183,7 @@ def run_single_job(
                     "params": int(num_params),
                     "H": int(H),
                     "W": int(W),
+                    "T": int(T),
                     "bpp": float(bpp),
                 }
             )
