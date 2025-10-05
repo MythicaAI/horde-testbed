@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 
 from encoding_utils import SineLayer, Tanh01, kernel_expand, compute_targeted_encodings, compute_helmholtz_encoding, compute_analytic_encoding
 
@@ -231,9 +232,11 @@ class SpecificDecoder(nn.Module):
     def __init__(self, device, **kwargs):
         super().__init__()
         torch.set_default_device(device)
+        self.trunk_interface = 64
         self.trunk_head = nn.Sequential(
-            nn.Linear(3, 64),
-            nn.ReLU(),
+            nn.Linear(3, self.trunk_interface),
+            nn.GELU(),
+            nn.LayerNorm(self.trunk_interface),
         )
 
         self.output_channels = 3
@@ -247,33 +250,38 @@ class SpecificDecoder(nn.Module):
         )
         
         self.pos_embeddings = 256
+        self.prefilm_dim = 128
         self.pos_embed = nn.Sequential(
-            nn.Linear(self.pos_embeddings, 128),
-            nn.ReLU(),
+            nn.Linear(self.pos_embeddings, self.prefilm_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.prefilm_dim),
         )
 
         self.time_embeddings = 64
         self.time_embed = nn.Sequential(
-            nn.Linear(self.time_embeddings, 128),
-            nn.ReLU(),
+            nn.Linear(self.time_embeddings, self.prefilm_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.prefilm_dim),
         )
 
-        self.film = nn.Linear(256, 128)
+        self.film = nn.Linear(self.prefilm_dim * 2, self.trunk_interface * 2)
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
 
-        pos_res = 1024
-        time_res = 500
+        pos_res = 2048
+        time_res = 1024
         self.pos_encoding_len = self.pos_embeddings - 2
         self.base_pos_freqs = torch.exp(
             torch.empty(self.pos_encoding_len).uniform_(0.0, math.log(pos_res / 2))
         )
         directions = torch.empty(self.pos_encoding_len).uniform_(0.0, 2 * math.pi)
         unit_vectors = torch.stack([torch.cos(directions), torch.sin(directions)], dim=1)
-        self.wavevectors = (self.base_pos_freqs.unsqueeze(1) * unit_vectors)
+        self.wavevectors = nn.Parameter(self.base_pos_freqs.unsqueeze(1) * unit_vectors)
 
         self.time_encoding_len = self.time_embeddings - 1
-        self.base_time_freqs = torch.exp(
+        self.base_time_freqs = nn.Parameter(torch.exp(
             torch.empty(self.time_encoding_len).uniform_(0.0, math.log(time_res / 2))
-        )
+        ))
     
     def forward(self, raw_pos, time):
         trunk_input = torch.cat([raw_pos, time], dim=-1)
@@ -297,8 +305,438 @@ class SpecificDecoder(nn.Module):
 
         film_input = torch.cat([pos_input, time_input], dim=-1)
         film_gamma, film_beta = self.film(film_input).chunk(2, dim=-1)
-        modulated = (film_gamma * trunk_out) + film_beta
+        modulated = ((1 + film_gamma) * trunk_out) + film_beta
         output = self.trunk_base(modulated)
+        return output
+
+class HybridHalfSine(nn.Module):
+    """
+    nn.Linear(d_in, d_out) with half ReLU, half sine activations.
+    Same parameter count as Linear.
+    """
+    def __init__(self, d_in, d_out, omega=30.0, first_layer=False, rotate=False):
+        super().__init__()
+        self.lin = nn.Linear(d_in, d_out)
+        self.omega = omega
+        # self.omega = nn.Parameter(torch.tensor(omega))
+        self.split = d_out // 2  # first half ReLU, second half sine
+        self.rotate = rotate
+
+        # init: standard for ReLU rows, scaled for sine rows
+        nn.init.kaiming_uniform_(self.lin.weight, a=0.0)
+        nn.init.zeros_(self.lin.bias)
+        if first_layer:
+            bound = 1.0 / d_in
+        else:
+            bound = (6.0 / d_in) ** 0.5 / self.omega
+        with torch.no_grad():
+            self.lin.weight[self.split:].uniform_(-bound, bound)
+            self.lin.bias[self.split:].fill_(0.0)
+
+    def forward(self, x):
+        z = self.lin(x)
+        a = F.relu(z[..., :self.split], inplace=False)
+        b = torch.sin(self.omega * z[..., self.split:])
+        if self.rotate:
+            return torch.cat([b, a], dim=-1)
+        else:
+            return torch.cat([a, b], dim=-1)
+
+
+class DualDecoder(nn.Module):
+    def __init__(self, device, low_freqs, high_freqs):
+        super().__init__()
+        torch.set_default_device(device)
+        self.num_harmonics = 256
+        self.low_freqs = low_freqs
+        self.high_freqs = high_freqs
+        self.output_channels = 3
+
+        self.low_linear_enc = nn.Linear(2, self.num_harmonics)
+        self.low_linear_first = nn.Sequential(
+            nn.Linear(self.num_harmonics * 2, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+        )
+
+        self.high_linear_enc = nn.Linear(2, self.num_harmonics)
+        self.high_linear_first = nn.Sequential(
+            nn.Linear(self.num_harmonics * 2, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+        )
+
+        self.time_linear_enc = nn.Linear(1, self.num_harmonics)
+
+        self.base_time_freqs = torch.exp(torch.empty(self.num_harmonics).uniform_(0.0, math.log(500)))
+
+        self.time_film = nn.Sequential(
+            nn.Linear(self.num_harmonics * 2, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics * 2),
+        )
+        # Initialize FiLM to identity: gamma=0 (so 1+gamma=1), beta=0
+        nn.init.zeros_(self.time_film[-1].weight)
+        nn.init.zeros_(self.time_film[-1].bias)
+
+        self.low_trunk = nn.Sequential(
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.output_channels + 1),
+            nn.Sigmoid()
+        )
+
+        self.high_trunk = nn.Sequential(
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.num_harmonics),
+            nn.ReLU(),
+            nn.Linear(self.num_harmonics, self.output_channels + 1),
+            nn.Sigmoid()
+        )
+        
+        # Call initialization
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Skip the FiLM layer since we already initialized it
+                if m is not self.time_film[-1]:
+                    nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, raw_pos, time):
+        low_enc_hh = compute_helmholtz_encoding(
+            raw_pos,
+            self.low_freqs.shape[0],
+            self.low_freqs,
+        )
+        low_enc_lin = self.low_linear_enc(raw_pos)
+        low_enc = torch.cat([low_enc_hh, low_enc_lin], dim=-1)
+        low_branch_start = self.low_linear_first(low_enc)
+
+        high_enc_hh = compute_helmholtz_encoding(
+            raw_pos,
+            self.high_freqs.shape[0],
+            self.high_freqs,
+        )
+        high_enc_lin = self.high_linear_enc(raw_pos)
+        high_enc = torch.cat([high_enc_hh, high_enc_lin], dim=-1)
+        high_branch_start = self.high_linear_first(high_enc)
+
+        time_enc_lin = self.time_linear_enc(time)
+        time_enc_sin = compute_analytic_encoding(
+            time,
+            self.num_harmonics,
+            freqs=self.base_time_freqs,
+            encoding_cycle=["sin"],
+        )
+        time_enc = torch.cat([time_enc_sin, time_enc_lin], dim=-1)
+        time_gamma, time_beta = self.time_film(time_enc).chunk(2, dim=-1)
+
+        low_modulated = ((1 + time_gamma) * low_branch_start) + time_beta
+        high_modulated = ((1 + time_gamma) * high_branch_start) + time_beta
+
+        low_out = self.low_trunk(low_modulated)
+        high_out = self.high_trunk(high_modulated)
+
+        rgb1, weight1 = low_out[..., :self.output_channels], low_out[..., -1:]
+        rgb2, weight2 = high_out[..., :self.output_channels], high_out[..., -1:]
+        weights = torch.softmax(torch.cat([weight1, weight2], dim=-1), dim=-1)
+        w1, w2 = weights[..., 0:1], weights[..., 1:2]
+        output = rgb1 * w1 + rgb2 * w2
+        return output
+
+
+class TestDecoder(nn.Module):  #WeirdRef
+    def __init__(self, device, freq_init=None, **kwargs):
+        defaults = {
+            "embedding_dim": 256,
+            "time_encoding_len": 128,
+            "pos_encoding_len": 256,
+            "output_channels": 3,
+            "time_res": 1024,
+        }
+        defaults.update(kwargs)
+
+        for key, value in defaults.items():
+            setattr(self, key, value)
+        super().__init__()
+        torch.set_default_device(device)
+
+        self.time_embed = nn.Sequential(
+            nn.Linear(self.time_encoding_len, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embedding_dim),
+        )
+
+        self.time_pos_modulate = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim * 2),  # -> [δγ | β]
+        )
+        # Identity FiLM init: δγ=0, β=0  ⇒  γ=1, β=0
+        nn.init.zeros_(self.time_pos_modulate[-1].weight)
+        nn.init.zeros_(self.time_pos_modulate[-1].bias)
+
+        self.pos_embed = nn.Sequential(
+            nn.Linear(self.pos_encoding_len, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embedding_dim),
+        )
+
+        self.wavevectors = freq_init
+
+        self.base_time_freqs = nn.Parameter(torch.exp(
+            torch.empty(self.time_encoding_len).uniform_(0.0, math.log(self.time_res / 2))
+        ))
+
+        self.trunk_base = nn.Sequential(
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim * 2),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim * 2),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim * 2),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim * 2, self.output_channels),
+            nn.Sigmoid()
+        )
+
+        for m in self.trunk_base:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
+                nn.init.zeros_(m.bias)
+
+    def forward(self, raw_pos, time):
+        time_enc = compute_analytic_encoding(
+            time,
+            self.time_encoding_len,
+            freqs=self.base_time_freqs,
+            encoding_cycle=["sin"],
+        )
+
+        encoded_pos = compute_helmholtz_encoding(
+            raw_pos,
+            self.pos_encoding_len,
+            self.wavevectors,
+        )
+
+        time_embedding = self.time_embed(time_enc)
+        gamma, beta = self.time_pos_modulate(time_embedding).chunk(2, dim=-1)
+
+        pos_embedding = self.pos_embed(encoded_pos)
+        pos_embedding = (( 1 + gamma) * pos_embedding) + beta
+        output = self.trunk_base(torch.cat([pos_embedding, time_embedding], dim=-1))
+        return output
+
+
+class TLearnedWaveVectorDecoder(nn.Module):
+    def __init__(self, device, **kwargs):
+        super().__init__()
+        torch.set_default_device(device)
+        self.embedding_dim = 256
+        self.time_encoding_len = 128
+        self.time_embed = nn.Sequential(
+            nn.Linear(self.time_encoding_len, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embedding_dim),
+        )
+
+        self.time_pos_transform = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 2),
+            nn.Tanh(),
+        )
+
+        self.pos_encoding_len = 256
+
+        self.time_wavevector_transform = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.pos_encoding_len * 2),
+            nn.GELU(),
+            nn.Linear(self.pos_encoding_len * 2, self.pos_encoding_len * 2),
+            nn.Tanh(),
+            nn.LayerNorm(self.pos_encoding_len * 2),
+        )
+
+        self.pos_embed = nn.Sequential(
+            nn.Linear(self.pos_encoding_len, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embedding_dim),
+        )
+
+        pos_res = 2048
+        time_res = 1024
+        self.base_pos_freqs = torch.exp(
+            torch.empty(self.pos_encoding_len).uniform_(0.0, math.log(pos_res / 2))
+        )
+        directions = torch.empty(self.pos_encoding_len).uniform_(0.0, 2 * math.pi)
+        unit_vectors = torch.stack([torch.cos(directions), torch.sin(directions)], dim=1)
+        self.wavevectors = (self.base_pos_freqs.unsqueeze(1) * unit_vectors)
+
+        self.base_time_freqs = nn.Parameter(torch.exp(
+            torch.empty(self.time_encoding_len).uniform_(0.0, math.log(time_res / 2))
+        ))
+
+        self.output_channels = 3
+        self.trunk_base = nn.Sequential(
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim // 2, self.output_channels),
+            nn.Sigmoid()
+        )
+
+    def safe_logit(self, p, eps=1e-5):
+        p = p.clamp(eps, 1 - eps)
+        return torch.log(p) - torch.log1p(-p)
+    
+    def forward(self, raw_pos, time):
+        time_enc = compute_analytic_encoding(
+            time,
+            self.time_encoding_len,
+            freqs=self.base_time_freqs,
+            encoding_cycle=["sin"],
+        )
+
+        time_embedding = self.time_embed(time_enc)
+        transform = self.time_pos_transform(time_embedding)
+
+        logit_pos = self.safe_logit(raw_pos)
+        transformed_pos = torch.sigmoid(logit_pos + transform)
+
+        wavevector_transform = self.time_wavevector_transform(time_embedding).reshape(-1, self.pos_encoding_len, 2)
+        wavevectors = self.wavevectors[None, :, :] + wavevector_transform
+
+        encoded_pos = compute_helmholtz_encoding(
+            transformed_pos,
+            self.pos_encoding_len,
+            wavevectors,
+        )
+
+        pos_embedding = self.pos_embed(encoded_pos)
+        output = self.trunk_base(torch.cat([pos_embedding, time_embedding], dim=-1))
+        return output
+
+
+class TModulatedDecoder(nn.Module):
+    def __init__(self, device, freq_init=None, **kwargs):
+        defaults = {
+            "embedding_dim": 256,
+            "time_encoding_len": 128,
+            "pos_encoding_len": 256,
+            "output_channels": 3,
+            "pos_res": 2048,
+            "time_res": 1024,
+        }
+        defaults.update(kwargs)
+        for key, value in defaults.items():
+            setattr(self, key, value)
+        super().__init__()
+        torch.set_default_device(device)
+
+        self.time_embed = nn.Sequential(
+            nn.Linear(self.time_encoding_len, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embedding_dim),
+        )
+
+        self.time_pos_modulate = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim * 2),
+            nn.Tanh(),
+            nn.LayerNorm(self.embedding_dim * 2),
+        )
+
+        self.pos_embed = nn.Sequential(
+            nn.Linear(self.pos_encoding_len, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.GELU(),
+            nn.LayerNorm(self.embedding_dim),
+        )
+
+        if freq_init is None:
+            self.base_pos_freqs = torch.exp(
+                torch.empty(self.pos_encoding_len).uniform_(0.0, math.log(pos_res / 2))
+            )
+            directions = torch.empty(self.pos_encoding_len).uniform_(0.0, 2 * math.pi)
+            unit_vectors = torch.stack([torch.cos(directions), torch.sin(directions)], dim=1)
+            self.wavevectors = nn.Parameter(self.base_pos_freqs.unsqueeze(1) * unit_vectors)
+        else:
+            assert freq_init.shape == (self.pos_encoding_len, 2)
+            self.wavevectors = nn.Parameter(freq_init)
+
+        self.base_time_freqs = nn.Parameter(torch.exp(
+            torch.empty(self.time_encoding_len).uniform_(0.0, math.log(self.time_res / 2))
+        ))
+
+        self.trunk_base = nn.Sequential(
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim * 2),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim * 2, self.embedding_dim),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim // 2, self.output_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, raw_pos, time):
+        time_enc = compute_analytic_encoding(
+            time,
+            self.time_encoding_len,
+            freqs=self.base_time_freqs,
+            encoding_cycle=["sin"],
+        )
+
+        encoded_pos = compute_helmholtz_encoding(
+            raw_pos,
+            self.pos_encoding_len,
+            self.wavevectors,
+        )
+
+        time_embedding = self.time_embed(time_enc)
+        gamma, beta = self.time_pos_modulate(time_embedding).chunk(2, dim=-1)
+
+        pos_embedding = self.pos_embed(encoded_pos)
+        pos_embedding = (gamma * pos_embedding) + beta
+        output = self.trunk_base(torch.cat([pos_embedding, time_embedding], dim=-1))
         return output
 
 
@@ -376,3 +814,117 @@ class BigDecoder(nn.Module):
         output = self.trunk_base(modulated)
         return output
 
+
+class CoordFlowish(nn.Module):
+    def __init__(self, device, **kwargs):
+        super().__init__()
+        torch.set_default_device(device)
+        self.embedding_dim = 192
+        self.encoding_dim = 180
+        self.output_channels = 3
+        self.time_embedding = nn.Sequential(
+            nn.Linear(self.encoding_dim, self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.ReLU(),
+        )
+
+        self.time_transform = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 4),
+        )
+        
+        self.x_embedding = nn.Sequential(
+            nn.Linear(self.encoding_dim, self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.ReLU(),
+        )
+
+        self.y_embedding = nn.Sequential(
+            nn.Linear(self.encoding_dim, self.embedding_dim),
+            nn.ReLU(),
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.ReLU(),
+        )
+
+        self.trunk_base = nn.Sequential(
+            nn.Linear(self.embedding_dim * 3, self.embedding_dim * 3),
+            nn.GELU(),
+            nn.Linear(self.embedding_dim * 3, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, self.output_channels),
+            nn.Sigmoid()
+        )
+
+        pos_res = 1024
+        time_res = 500
+        self.x_freqs = torch.exp(
+            torch.empty(self.encoding_dim).uniform_(0.0, math.log(pos_res / 2))
+        )
+        self.y_freqs = torch.exp(
+            torch.empty(self.encoding_dim).uniform_(0.0, math.log(pos_res / 2))
+        )
+        self.time_freqs = torch.exp(
+            torch.empty(self.encoding_dim).uniform_(0.0, math.log(time_res / 2))
+        )
+    
+    def forward(self, raw_pos, time):
+        raw_pos = raw_pos * 2.0 - 1.0  # scale to [-1, 1]
+        time_enc = compute_analytic_encoding(
+            time,
+            self.encoding_dim,
+            freqs=self.time_freqs,
+            encoding_cycle=["sin", "cos"],
+        )
+
+        time_embedding = self.time_embedding(time_enc)
+
+        transform = self.time_transform(time_embedding)
+        s, theta, dx, dy = transform.chunk(4, dim=-1)
+        s = torch.exp(0.1 * s).clamp(0.7, 1.3)
+        theta = math.pi * torch.tanh(theta)  # rotate between -pi and pi
+        dx = 0.1 * torch.tanh(dx)
+        dy = 0.1 * torch.tanh(dy)
+        rot1 = torch.stack([s * torch.cos(theta), -s * torch.sin(theta)], dim=-1)
+        rot2 = torch.stack([s * torch.sin(theta),  s * torch.cos(theta)], dim=-1)
+        translate = torch.stack([dx, dy], dim=-1)
+        transform_mat = torch.cat([rot1, rot2, translate], dim=-2)
+        padded_pos = torch.cat([raw_pos, torch.ones(raw_pos.shape[0], 1, device=raw_pos.device)], dim=-1)
+
+        # print(f"Raw pos stats: {raw_pos.mean().item():.4f} ± {raw_pos.std().item():.4f}")
+        transformed_pos = (padded_pos.unsqueeze(1) @ transform_mat).squeeze(1)
+        recentered_pos = (transformed_pos + 1.0) / 2.0
+        transformed_pos = torch.sigmoid(recentered_pos)
+        # print(f"Transformed pos stats: {transformed_pos.mean().item():.4f} ± {transformed_pos.std().item():.4f}")
+
+        x_enc = compute_analytic_encoding(
+            transformed_pos[:, :1],
+            self.encoding_dim,
+            freqs=self.x_freqs,
+            encoding_cycle=["sin", "cos"],
+        )
+        x_embedding = self.x_embedding(x_enc)
+
+        y_enc = compute_analytic_encoding(
+            transformed_pos[:, 1:2],
+            self.encoding_dim,
+            freqs=self.y_freqs,
+            encoding_cycle=["sin", "cos"],
+        )
+        y_embedding = self.y_embedding(y_enc)
+
+        trunk_input = torch.cat([x_embedding, y_embedding, time_embedding], dim=-1)
+        output = self.trunk_base(trunk_input).clamp(0.0, 1.0)
+        return output

@@ -33,6 +33,10 @@ def run_single_job(job, static_dir):
             image_dir=dataset_path,
             device=torch.device(decoder_config.pop("device", "cuda")),
             experiment_name=name,
+            batch_size=decoder_config.pop("batch_size", 8),
+            patch_size=decoder_config.pop("patch_size", 32),
+            epochs=decoder_config.pop("epochs", 1000),
+            batches_per_epoch=decoder_config.pop("batches_per_epoch", 1000),
             decoder_type=decoder_config.pop("decoder_type"),
             decoder_config=decoder_config,
         )

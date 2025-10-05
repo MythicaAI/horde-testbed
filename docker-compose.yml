@@ -35,8 +35,10 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
     networks:
       - horde-network
 

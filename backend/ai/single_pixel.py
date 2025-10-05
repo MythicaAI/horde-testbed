@@ -8,12 +8,14 @@ import torch.profiler as profiler
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torchvision.utils import save_image
 
 from torch.utils.data import DataLoader, TensorDataset
 from piq import ssim, SSIMLoss, psnr
 from torch.utils.tensorboard import SummaryWriter
 
-from decoders import VFXSpiralNetDecoder, SpecificDecoder, BigDecoder
+from decoders import VFXSpiralNetDecoder, SpecificDecoder, BigDecoder, CoordFlowish, TestDecoder, TLearnedWaveVectorDecoder, TModulatedDecoder, DualDecoder
+from encoding_utils import sample_fourier_transforms
 from losses import DCTLoss, GradientLoss
 from make_shader import decoder_to_glsl, compare_decoder_and_shader, save_weights_to_exr
 from image_utils import load_images, save_images
@@ -31,12 +33,25 @@ class VFXNet(nn.Module):
         self.height = height
         self.width = width
         decoder_config = decoder_config or {}
+        freq_init = decoder_config.pop("freq_init", None)
+        low_freqs = decoder_config.pop("low_freq_init", None)
+        high_freqs = decoder_config.pop("high_freq_init", None)
         if decoder_type == "SpiralNet":
             self.decoder = VFXSpiralNetDecoder(device, **decoder_config)
         elif decoder_type == "Specific":
             self.decoder = SpecificDecoder(device, **decoder_config)
         elif decoder_type == "Big":
             self.decoder = BigDecoder(device, **decoder_config)
+        elif decoder_type == "CoordFlowish":
+            self.decoder = CoordFlowish(device, **decoder_config)
+        elif decoder_type == "Test":
+            self.decoder = TestDecoder(device, freq_init, **decoder_config)
+        elif decoder_type == "TLearnedWaveVector":
+            self.decoder = TLearnedWaveVectorDecoder(device, **decoder_config)
+        elif decoder_type == "TModulated":
+            self.decoder = TModulatedDecoder(device, freq_init, **decoder_config)
+        elif decoder_type == "Dual":
+            self.decoder = DualDecoder(device, low_freqs, high_freqs, **decoder_config)
         else:
             raise ValueError(f"Unknown decoder type: {decoder_type}")
         if getattr(self.decoder, "latent_dim", 0) > 0:
@@ -69,8 +84,8 @@ class VFXNet(nn.Module):
 
     def full_image(self, time, H=512, W=512):
         safe_batch_size = 512 * 512
-        x_coords = torch.linspace(0, 1, W, device=self.device)
-        y_coords = torch.linspace(0, 1, H, device=self.device)
+        x_coords = torch.linspace(-1, 1, W, device=self.device)
+        y_coords = torch.linspace(-1, 1, H, device=self.device)
         grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
         raw_pos = torch.stack([grid_x, grid_y], dim=-1)
         expanded_time = time.repeat(H, W, 1)
@@ -206,13 +221,15 @@ def subsample_random_pixels(num_samples, image_tensor, raw_pos, control_tensor):
 
 
 class PatchSampler(torch.utils.data.IterableDataset):
-    def __init__(self, image_tensor, device, tile_size=32, batch_size=8, dtype=torch.float32):
+    def __init__(self, image_tensor, device, tile_size, batch_size, threshold_psnr=35, dtype=torch.float32):
         self.device = device
         self.tile_size = tile_size
         self.margin_size = self.tile_size // 2
         self.image_tensor = image_tensor.permute(0, 3, 1, 2)  # Change to NCHW format
         self.T, self.C, self.H, self.W = self.image_tensor.shape
-        
+        self.current_T = 0
+        self.threshold_psnr = threshold_psnr
+
         dx = self.margin_size / self.W
         dy = self.margin_size / self.H
         self.kernel_x = torch.linspace(-dx, dx, tile_size, dtype=image_tensor.dtype, device=device)
@@ -224,13 +241,15 @@ class PatchSampler(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         while True:
-            times = torch.randint(0, self.T, (self.batch_size,), device=self.image_tensor.device)
+            times = torch.randint(0, self.current_T + 1, (self.batch_size,), device=self.image_tensor.device)
+
             image_batch = self.image_tensor[times].to(device=self.device)  # Move to GPU
             patch_centers = torch.rand((self.batch_size, 2), dtype=self.image_tensor.dtype, device=self.device) * 2 - 1
             patch_grid = self.patch_kernel.unsqueeze(0) + patch_centers[:, None, None, :]  # [B, tile, tile, 2]
             
             patch_batch = F.grid_sample(image_batch, patch_grid).requires_grad_(True)  # [B, C, tile, tile]
-            patch_grid = ((patch_grid + 1) / 2).clamp(0.0, 1.0)
+            # Keep patch_grid in [-1, 1] range to match Fourier frequency assumptions
+            patch_grid = patch_grid.clamp(-1.0, 1.0)
 
             times_patch = times.float().view(-1, 1, 1, 1).expand(-1, self.tile_size, self.tile_size, 1)
             yield (
@@ -238,6 +257,11 @@ class PatchSampler(torch.utils.data.IterableDataset):
                 patch_grid.to(dtype=self.dtype, device=self.device),
                 (times_patch / self.T).to(dtype=self.dtype, device=self.device)
             )
+    
+    def update_time(self):
+        if self.current_T < self.T - 1:
+            self.current_T += 1
+        print(f"PatchSampler current_T updated to {self.current_T}")
 
 
 class PSNRLoss(nn.Module):
@@ -253,16 +277,40 @@ class PSNRLoss(nn.Module):
         return -psnr
 
 
-def train_vfx_model(image_dir, device, epochs=1000, batch_size=8192, experiment_name=None, decoder_type="SpiralNet", decoder_config=None):
+def train_vfx_model(
+    image_dir,
+    device,
+    batch_size,
+    patch_size,
+    epochs,
+    batches_per_epoch,
+    experiment_name=None,
+    decoder_type="SpiralNet",
+    decoder_config=None
+):
     image_tensor = load_images(image_dir)
     T, H, W, C = image_tensor.shape
 
-    mse_loss = nn.MSELoss().to(device)
-    dct_loss = DCTLoss().to(device)
-    gradient_loss = GradientLoss().to(device)
-    ssim_loss = SSIMLoss(data_range=1.0).to(device)
     psnr_loss = PSNRLoss(data_range=1.0).to(device)
 
+    freq_init, _ = sample_fourier_transforms(image_tensor, decoder_config.get("pos_encoding_len", 512), device)
+    # sort and split frequencies for Dual decoder by magnitude
+    if decoder_type == "Dual":
+        # Sort by magnitude (L2 norm) instead of raw values
+        freq_magnitudes = torch.linalg.norm(freq_init, dim=1)
+        sorted_indices = torch.argsort(freq_magnitudes)
+        freq_init_sorted = freq_init[sorted_indices]
+        
+        mid = freq_init_sorted.shape[0] // 2
+        low_freq_init = freq_init_sorted[:mid]  # Lower magnitude frequencies
+        high_freq_init = freq_init_sorted[mid:]  # Higher magnitude frequencies
+        
+        print(f"low freq magnitudes: {torch.linalg.norm(low_freq_init, dim=1).min().item():.4f} to {torch.linalg.norm(low_freq_init, dim=1).max().item():.4f}")
+        print(f"high freq magnitudes: {torch.linalg.norm(high_freq_init, dim=1).min().item():.4f} to {torch.linalg.norm(high_freq_init, dim=1).max().item():.4f}")
+        decoder_config["low_freq_init"] = low_freq_init
+        decoder_config["high_freq_init"] = high_freq_init
+    else:
+        decoder_config["freq_init"] = freq_init
     model = VFXNet(H, W, device, decoder_type=decoder_type, decoder_config=decoder_config)
     model.experiment_name = experiment_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     optimizer = SOAP(
@@ -273,9 +321,18 @@ def train_vfx_model(image_dir, device, epochs=1000, batch_size=8192, experiment_
     base_path = f"anim_tests/{model.experiment_name}"
     os.makedirs(os.path.dirname(base_path), exist_ok=True)
 
-    dataset = PatchSampler(image_tensor, device, batch_size=64)
+    dataset = PatchSampler(image_tensor, device, tile_size=patch_size, batch_size=batch_size)
     dataloader = DataLoader(dataset, batch_size=None)
-    log_epochs = list(range(0, 11, 1)) + list(range(10, 51, 5)) + list(range(50, 101, 10)) + list(range(100, 501, 50)) + list(range(500, 1001, 100))
+    # Logging epochs: more frequent at start, less frequent later
+    log_epochs = (
+        list(range(0, 11, 1))   # 0-10 every epoch
+        + list(range(10, 51, 5))   # 10-50 every 5 epochs
+        + list(range(50, 101, 10)) # 50-100 every 10 epochs
+        + list(range(100, 501, 50)) # 100-500 every 50 epochs
+        + list(range(500, 1001, 100)) # 500-1000 every 100 epochs
+    )
+    if epochs > 1000:
+        log_epochs += list(range(1000, epochs, 250))
 
     writer = SummaryWriter(f'runs/{model.experiment_name}')
     writer.add_text('Config/Decoder', json.dumps(decoder_config or {}, indent=2), 0)
@@ -286,57 +343,42 @@ def train_vfx_model(image_dir, device, epochs=1000, batch_size=8192, experiment_
             torch.zeros((7, 1), device=device),
         )
     )
-    batches_per_epoch = 1000
-    total_pixel_loss = 0.0
+    
+    epoch_numbers = torch.arange(epochs)
+    first_batch_sizes = torch.linspace(100, 1000, steps=250)
+    remainder_sizes = torch.full((750,), 1000)
+    full_batch_sizes = torch.cat([first_batch_sizes, remainder_sizes]).long()
+
     total_patch_loss = 0.0
     global_step = 0
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     for epoch in range(epochs):
+        batches_per_epoch = full_batch_sizes[epoch].item()
         model.train()
         batch_num = 0
         total_pixel_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)
         for image_patches, pos_patches, time_patches in dataloader:
             # Permute reconstructed_image from [B, H, W, C] to [B, C, H, W] and select first 3 channels
             reconstructed_image = model.run_patch(pos_patches, time_patches)[..., :3]
             reconstructed_image_patches = reconstructed_image.permute(0, 3, 1, 2)
-            ssim_weight, ssim_component = 0.5, ssim_loss(reconstructed_image_patches, image_patches)
-            psnr_weight, psnr_component = 0.5, psnr_loss(reconstructed_image_patches, image_patches)
-            patch_loss = ssim_weight * ssim_component + psnr_weight * psnr_component
+            psnr_component = psnr_loss(reconstructed_image_patches, image_patches)
 
             if batch_num % 100 == 0:
                 print(f"Batch {batch_num+1}/{batches_per_epoch}")
-            
-            mse_weight, mse_component = 0.1, mse_loss(reconstructed_image_patches, image_patches)
-            dct_weight, dct_component = 0.15, dct_loss(reconstructed_image_patches, image_patches)
-            l1_weight, l1_component = 0.75, F.l1_loss(reconstructed_image_patches, image_patches)
 
-            pixel_loss = (
-                mse_weight * mse_component +
-                dct_weight * dct_component +
-                l1_weight * l1_component
-            )
-
-            total_loss = pixel_loss + patch_loss
-            optimizer.zero_grad()
             psnr_component.backward()
-            optimizer.step()
-
-            writer.add_scalar('Loss/MSE', mse_component.item(), global_step)
-            writer.add_scalar('Loss/DCT', dct_component.item(), global_step)
-            writer.add_scalar('Loss/L1', l1_component.item(), global_step)
-            writer.add_scalar('Loss/SSIM', ssim_component.item(), global_step)
-            writer.add_scalar('Loss/PSNR', psnr_component.item(), global_step)
-
-            total_pixel_loss += pixel_loss.item()
-            total_patch_loss += patch_loss.item()
+            total_patch_loss += psnr_component.item()
             batch_num += 1
             if batch_num >= batches_per_epoch:
                 break
-        total_pixel_loss /= batches_per_epoch
+        optimizer.step()
         total_patch_loss /= batches_per_epoch
+        if -total_patch_loss > dataset.threshold_psnr:
+            dataset.update_time()
 
         if epoch in log_epochs:
-            print(f"Epoch {epoch+1} - Pixel loss: {total_pixel_loss:.4f}, Patch loss: {total_patch_loss:.4f}")
+            print(f"Experiment {model.experiment_name}, Epoch {epoch}, Patch PSNR Loss: {total_patch_loss:.6f}")
             epoch_dir = f"{base_path}/epoch_{epoch}"
             os.makedirs(epoch_dir, exist_ok=True)
             model.eval()  # Set model to evaluation mode
@@ -345,11 +387,16 @@ def train_vfx_model(image_dir, device, epochs=1000, batch_size=8192, experiment_
                 test_frames = 10
                 save_images(model, H=256, W=256, n_images=debug_frames, gif_frames=T, base_dir=epoch_dir)
 
-                test_controls = torch.randint(0, T, (test_frames,), device=image_tensor.device)
+                test_controls = torch.randint(0, dataset.current_T + 1, (test_frames,), device=image_tensor.device)
                 base_batch = image_tensor[test_controls]
 
                 print("Computing test batch...")
                 pred_batch = [model.full_image(test_control / T, H, W) for test_control in test_controls]
+                for i, full_res_image in enumerate(pred_batch):
+                    rgb_image = full_res_image.squeeze(0).permute(2, 0, 1)  # [C, H, W]
+                    rgb_path = os.path.join(epoch_dir, f"full_res_rgb_{i}.png")
+                    save_image(rgb_image, rgb_path)
+
                 pred_batch = torch.stack(pred_batch).to(dtype=torch.float32)
                 print(f"Base batch shape: {base_batch.shape}, Pred batch shape: {pred_batch.shape}")
 

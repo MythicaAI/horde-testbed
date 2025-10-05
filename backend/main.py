@@ -12,7 +12,7 @@ JSONEncoder.default = _default
 
 from pydantic import BaseModel
 import numpy as np
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -63,67 +63,34 @@ async def serve_static(file_path: str):
 
 app.add_middleware(CORSMiddlewareForStaticFiles)
 
-# Simple spawn buffer
-ENEMY_SPAWN_QUEUE = []
 
-@app.post("/frame-update")
-async def frame_update(request: Request):
-    global ENEMY_SPAWN_QUEUE
+WORLD_SETUP = {
+    "resolution": 1024,
+    "latent_dim": 256,
+    "dtype": "float16",
+    "device": "cuda",
+}
 
-    data = await request.json()
-    game_state = FrameUpdate.parse_obj(data)
 
-    # Use world_config parameters
-    field_resolution = WORLD_SETUP["minimap_resolution"]
-    grid_size = (field_resolution, field_resolution)
-    ground_size = WORLD_SETUP["ground_size"]
+class GameMem:
+    def __init__(self, setup_config: Dict):
+        self.lock = asyncio.Lock()
+        self.world_id = str(uuid.uuid4())
+        world_size = (WORLD_SETUP["resolution"], WORLD_SETUP["resolution"], WORLD_SETUP["latent_dim"])
+        self.world_latent = torch.randn(world_size, dtype=WORLD_SETUP["dtype"], device=WORLD_SETUP["device"])
 
-    # Default fields
-    pressure_field = np.zeros(grid_size, dtype=np.float32)
-    flow_field = np.zeros((*grid_size, 2), dtype=np.float32)
-    difficulty = 0.0
+GM = GameMem(WORLD_SETUP)
 
-    if game_state.enemiesState:
-        pressure_field, flow_field = generate_fields(game_state.playerState, game_state.enemiesState, grid_size, ground_size)
-    else:
-        pressure_field = np.zeros(grid_size, dtype=np.float32)
-        flow_field = np.zeros((*grid_size, 2), dtype=np.float32)
-
-    # Spawn logic
-    if random.random() < 0.3:
-        spawn_id = str(uuid.uuid4())
-        radius_span = (5, 15)
-        distance = random.uniform(*radius_span)
-        angle = random.uniform(0, 2 * np.pi)
-        x = game_state.playerState.position[0] + distance * np.cos(angle)
-        z = game_state.playerState.position[2] + distance * np.sin(angle)
-        ENEMY_SPAWN_QUEUE.append({
-            "id": spawn_id,
-            "position": [x, 0, z],
-            "kind": random.choice(list(ENEMY_REGISTRY.keys())),
-        })
-
-    # Send response to frontend
-    spawns = ENEMY_SPAWN_QUEUE
-    ENEMY_SPAWN_QUEUE = []  # Clear after sending
-
-    return {
-        "spawn": spawns,
-        "pressure_field": pressure_field.tolist(),
-        "flow_field": flow_field.tolist(),
-        "difficulty": difficulty,
-    }
-
-@app.get("/enemy-kernels")
-async def get_enemy_kernels():
+async def _save_world_async(world_id: str, world_cpu: torch.Tensor, meta: dict) -> None:
     """
-    Returns the available enemy kernels.
+    Save CPU copy to disk without blocking the event loop.
+    Uses torch.save with a simple dict payload.
     """
-    return ENEMY_REGISTRY
+    out_path = os.path.join(SAVE_DIR, f"{world_id}.pt")
+    payload = {"meta": meta, "shape": tuple(world_cpu.shape), "world": world_cpu}
+    await anyio.to_thread.run_sync(torch.save, payload, out_path, pickle_protocol=5)
 
-@app.get("/world-setup")
-async def get_world_setup():
-    """
-    Returns the game setup configuration.
-    """
-    return WORLD_SETUP
+
+# @app.get("/nika_world/start-game")
+# async def start_game():
+    

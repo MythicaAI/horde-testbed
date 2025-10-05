@@ -545,17 +545,169 @@ EXPERIMENTS = []
 #         }
 #     ]
 
-# for i in range(2):
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"FireLogTest",
+#         "dataset": "VFX/fire_circles",
+#         "config": {
+#             "decoder_type": "Specific",
+#             "device": "cuda:1",
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"NormedSmallBeauty",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "Specific",
+#             "device": "cuda:1",
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"WeirdTestBeauty",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "Test",
+#             "device": "cuda:0",
+#         }
+#     }
+# ]
+
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"TConditionedFire",
+#         "dataset": "VFX/fire_circles",
+#         "config": {
+#             "decoder_type": "TLearnedWaveVector",
+#             "device": "cuda:1",
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"TimeBaseFire",
+#         "dataset": "VFX/fire_circles",
+#         "config": {
+#             "decoder_type": "Test",
+#             "device": "cuda:1",
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"TModulatedBeauty2",
+#         "dataset": "VFX/fire_circles",
+#         "config": {
+#             "decoder_type": "TModulated",
+#             "device": "cuda:1",
+#         }
+#     }
+# ]
+
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"FourInitTModulatedFire",
+#         "dataset": "VFX/fire_circles",
+#         "config": {
+#             "decoder_type": "TModulated",
+#             "device": "cuda",
+#             "pos_encoding_len": 256,
+#         }
+#     }
+# ]
+
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"FourTModulatedBeauty",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "TModulated",
+#             "device": "cuda:1",
+#             "pos_encoding_len": 256,
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"WideTimeTest",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "Test",
+#             "device": "cuda:1",
+#             "time_encoding_len": 1024,
+#         }
+#     }
+# ]
+
 EXPERIMENTS += [
     {
-        "name": f"BigBeauty",
+        "name": "35Forever",
         "dataset": "benchmarks/uvg/beauty",
         "config": {
-            "decoder_type": "Big",
-            "device": "cuda",
+            "decoder_type": "Dual",
+            "device": "cuda:1",
+            "batch_size": 128,
+            "epochs": 100000,
         }
     }
 ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"WideFourModulatedFire",
+#         "dataset": "VFX/fire_circles",
+#         "config": {
+#             "decoder_type": "TModulated",
+#             "device": "cuda",
+#             "pos_encoding_len": 1024,
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"TConditionedBeauty",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "TLearnedWaveVector",
+#             "device": "cuda",
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"BoundCoordFlowishBeautyTest",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "CoordFlowish",
+#             "device": "cuda",
+#         }
+#     }
+# ]
+
+# EXPERIMENTS += [
+#     {
+#         "name": f"BigBeauty",
+#         "dataset": "benchmarks/uvg/beauty",
+#         "config": {
+#             "decoder_type": "Big",
+#             "device": "cuda",
+#         }
+#     }
+# ]
 
 # for i in range(3):
 #     EXPERIMENTS += [
