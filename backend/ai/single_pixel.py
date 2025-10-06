@@ -271,7 +271,9 @@ class PSNRLoss(nn.Module):
         self.eps = eps
 
     def forward(self, pred, target):
-        mse = torch.mean((pred - target) ** 2)
+        pred_f32 = pred.float()
+        target_f32 = target.float()
+        mse = torch.mean((pred_f32 - target_f32) ** 2)
         psnr = 10 * torch.log10((self.data_range ** 2) / (mse + self.eps))
         # negate so lower is worse, higher is better (like SSIMLoss)
         return -psnr
@@ -424,4 +426,3 @@ def get_total_grad_norm(model, norm_type=2):
             total_norm += param_norm.item() ** norm_type
     total_norm = total_norm ** (1. / norm_type)
     return total_norm
-

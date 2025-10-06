@@ -5,6 +5,7 @@ import imageio.v3 as iio
 import numpy as np
 from torchvision.utils import save_image
 from torchvision.transforms import GaussianBlur
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from encoding_utils import (
     sample_fourier_transforms,
@@ -82,16 +83,17 @@ class BasicRecon(nn.Module):
         self,
         device,
         low_init_freqs,
-        coarse_centers,
-        coarse_sigmas,
+        # coarse_centers,
+        # coarse_sigmas,
         high_init_freqs,
-        fine_centers,
-        fine_sigmas,
+        # fine_centers,
+        # fine_sigmas,
         num_harmonics=256,
         hidden_dim=256,
         output_channels=3
     ):
         super().__init__()
+        print("Setting default device", device)
         torch.set_default_device(device)
         self.device = device
         self.output_channels = output_channels
@@ -134,19 +136,19 @@ class BasicRecon(nn.Module):
         self.decoder2 = nn.Sequential(*layers2)
 
         self.low_wavevectors = low_init_freqs
-        self.coarse_centers = coarse_centers
-        self.coarse_sigmas = coarse_sigmas
+        # self.coarse_centers = coarse_centers
+        # self.coarse_sigmas = coarse_sigmas
 
         self.high_wavevectors = high_init_freqs
-        self.fine_centers = fine_centers
-        self.fine_sigmas = fine_sigmas        
+        # self.fine_centers = fine_centers
+        # self.fine_sigmas = fine_sigmas
         # self.rbf_sigmas = F.softplus(torch.full((num_harmonics,), torch.log(torch.exp(torch.tensor(0.25))-1))) + 0.01
         self.low_wavevectors.detach()
-        self.coarse_centers.detach()
-        self.coarse_sigmas.detach()
+        # self.coarse_centers.detach()
+        # self.coarse_sigmas.detach()
         self.high_wavevectors.detach()
-        self.fine_centers.detach()
-        self.fine_sigmas.detach()
+        # self.fine_centers.detach()
+        # self.fine_sigmas.detach()
 
     def forward(self, raw_pos):
         # branch_weight = self.switcher(raw_pos).squeeze(-1)
@@ -157,11 +159,11 @@ class BasicRecon(nn.Module):
             self.pos_encoding_len,
             self.low_wavevectors,
         ).detach()
-        coarse_rbfs = compute_rbf_encoding(
-            raw_pos,
-            self.coarse_centers,
-            self.coarse_sigmas
-        ).detach()
+        # coarse_rbfs = compute_rbf_encoding(
+        #     raw_pos,
+        #     self.coarse_centers,
+        #     self.coarse_sigmas
+        # ).detach()
 
         high_encoded_linear = self.linear_enc2(raw_pos)
         high_encoded_hh = compute_helmholtz_encoding(
@@ -169,11 +171,11 @@ class BasicRecon(nn.Module):
             self.pos_encoding_len,
             self.high_wavevectors,
         ).detach()
-        fine_rbfs = compute_rbf_encoding(
-            raw_pos,
-            self.fine_centers,
-            self.fine_sigmas
-        ).detach()
+        # fine_rbfs = compute_rbf_encoding(
+        #     raw_pos,
+        #     self.fine_centers,
+        #     self.fine_sigmas
+        # ).detach()
 
         encoded_pos1 = torch.cat([low_encoded_linear, low_encoded_hh], dim=-1)
         encoded_pos2 = torch.cat([high_encoded_linear, high_encoded_hh], dim=-1)
@@ -209,7 +211,7 @@ class BasicRecon(nn.Module):
                 chunks.append(self.forward(chunk_pos))
             reconstructed = torch.cat(chunks, dim=0)
             return reconstructed.view(H, W, 3)
-    
+
     def visualize_switching(self, H=512, W=512):
         with torch.inference_mode():
             x_coords = torch.linspace(-1, 1, W, device=self.device)
@@ -222,7 +224,7 @@ class BasicRecon(nn.Module):
             return branch_weight.view(H, W)
 
 
-def full_image_train(image, model, opt, loss, H=512, W=512):
+def full_image_train(image, model, opt, loss, H=512, W=512, scaler=None):
     x_coords = torch.linspace(-1, 1, W, device=model.device)
     y_coords = torch.linspace(-1, 1, H, device=model.device)
     grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
@@ -232,61 +234,72 @@ def full_image_train(image, model, opt, loss, H=512, W=512):
 
     flat_image = image.view(-1, image.shape[-1])
 
-    safe_batch_size = 512*512
+    safe_batch_size = 4*512*512
     opt.zero_grad(set_to_none=True)
-    total_loss = 0.0
-    
+    total_loss = torch.zeros((), device=model.device, dtype=torch.float32)
+
     # Debug: check if we have the right total size
     actual_processed = 0
-    total_loss = 0.0
+    use_autocast = scaler is not None
+
     for i in range(0, flat_pos.shape[0], safe_batch_size):
         chunk_pos = flat_pos[i:i+safe_batch_size]
         chunk_size = chunk_pos.shape[0]
         chunk_target = flat_image[i:i+safe_batch_size]
-        chunk_out = model.forward(chunk_pos)
-        
-        # Compute loss for this chunk (should be mean over chunk)
-        chunk_loss = loss(chunk_out, chunk_target)
-        
-        # Weight by chunk size for proper averaging
-        # weighted_loss = chunk_loss * (chunk_size / N)
-        chunk_loss.backward()
-        total_loss += chunk_loss.item()
+
+        with torch.cuda.amp.autocast(enabled=use_autocast):
+            chunk_out = model.forward(chunk_pos)
+            # Compute loss for this chunk (should be mean over chunk)
+            chunk_loss = loss(chunk_out, chunk_target)
+
+        if scaler is not None:
+            scaler.scale(chunk_loss).backward()
+        else:
+            chunk_loss.backward()
+
+        total_loss += chunk_loss.detach().float()
         actual_processed += chunk_size
     total_loss /= ((N / safe_batch_size) + 0.1)  # Average loss over all chunks
-    
+
     # Verify we processed all pixels
     assert actual_processed == N, f"Processed {actual_processed} but expected {N}"
-    
-    opt.step()
+
+    if scaler is not None:
+        scaler.step(opt)
+        scaler.update()
+    else:
+        opt.step()
     return total_loss
 
 
 def single_frame_recon_test(png_path, device, num_harmonics=256, hidden_dim=256):
     gt = load_image(png_path, device)
     B, H, W, C = gt.shape
-    
+
     low_freq_init, idx = sample_fourier_transforms(gt, num_harmonics, device)
     recon, residual = residual_after_modes(gt, idx, device=device)
-    coarse_centers, coarse_sigmas, _ = compute_dog(residual, sigma_min=16)
+    # coarse_centers, coarse_sigmas, _ = compute_dog(residual, sigma_min=16)
 
     high_freq_init, idx = sample_fourier_transforms(residual, num_harmonics, device)
     recon, residual = residual_after_modes(residual, idx, device=device)
-    fine_centers, fine_sigmas, _ = compute_dog(residual, sigma_min=4)
+    # fine_centers, fine_sigmas, _ = compute_dog(residual, sigma_min=4)
 
     model = BasicRecon(
         device,
         low_freq_init,
-        coarse_centers,
-        coarse_sigmas,
+        #coarse_centers,
+        #coarse_sigmas,
         high_freq_init,
-        fine_centers,
-        fine_sigmas,
+        #fine_centers,
+        #fine_sigmas,
         num_harmonics,
         hidden_dim,
         output_channels=C
     ).to(device)
+    # model = torch.compile(model)
 
+    use_amp = device.startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     psnr_loss = PSNRLoss()
     optimizer = SOAP(
         model.parameters(),
@@ -295,19 +308,16 @@ def single_frame_recon_test(png_path, device, num_harmonics=256, hidden_dim=256)
     target = gt.squeeze(0)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    for iter in range(2000):
-        # optimizer.zero_grad()
-        loss = full_image_train(target, model, optimizer, psnr_loss, H, W)
+    for iter in range(10):
+        loss = full_image_train(target, model, optimizer, psnr_loss, H, W, scaler=scaler if use_amp else None)
         # loss = psnr_loss(output, target)
         # loss.backward()
         # optimizer.step()
-        print(f"Iter {iter+1}, PSNR: {-loss:.2f} dB")
 
         if (iter + 1) % 100 == 0:
             with torch.no_grad():
                 val_output = model.full_image_inf(H=H, W=W)
                 val_loss = psnr_loss(val_output, target)
-                print(f"Validation PSNR at iter {iter+1}: {-val_loss.item():.2f} dB with {num_params} params")
                 residual_image = ((val_output - target) + 1.0) * 0.5
                 # normalize residual to [0,1]
                 residual_image = (residual_image - residual_image.min()) / (residual_image.max() - residual_image.min() + 1e-6)
@@ -318,16 +328,24 @@ def single_frame_recon_test(png_path, device, num_harmonics=256, hidden_dim=256)
                 # save_image(switch_map, f"ai/test_runs/switchmap_iter_{iter+1:04d}_{num_params}params.png")
 
 
+
 if __name__ == "__main__":
-    png_path = "static/benchmarks/uvg/beauty/beauty_frame_000001.png"
+    png_path = "uvg/beauty/beauty_frame_000042.png"
     image = load_image(png_path, "cuda:1")
-    centers, sigmas, vals = compute_dog(image, sigma_min=16)
-    save_gaussians_as_image(vals, centers, sigmas)
+    # centers, sigmas, vals = compute_dog(image, sigma_min=16)
+    # save_gaussians_as_image(vals, centers, sigmas)
 
     # recon, residual = residual_from_gaussians(image, centers, sigmas)
     # # save images
     # save_image(recon.squeeze(0).permute(2,0,1), "ai/test_runs/02dog_recon.png")
     # save_image(residual.squeeze(0).permute(2,0,1), "ai/test_runs/02dog_residual.png")
     # EncodingSelector(image, pool_size=10000, top_k=256)
-    # single_frame_recon_test(png_path, "cuda:1", num_harmonics=256, hidden_dim=256)
-    
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, profile_memory=True) as prof:
+        single_frame_recon_test(png_path, "cuda:1", num_harmonics=256, hidden_dim=256)
+
+    print("CUDA Time Total\n", prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    print("CPU Time Total\n", prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+    print("CUDA Memory Usage\n", prof.key_averages().table(sort_by="cuda_memory_usage", row_limit=10))
+    print("CPU Memory Usage\n", prof.key_averages().table(sort_by="cpu_memory_usage", row_limit=10))
+
+    prof.export_chrome_trace("trace.json")
